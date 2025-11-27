@@ -1,0 +1,29 @@
+gcc -std=c++11 -O3 -mcpu=power8 -fopenmp OpenMPlus.cpp -o OpenMPlus_job_128
+
+
+bsub < OpenMPlus_job_128_1.lsf
+
+bsub < OpenMPlus_job_128_2.lsf
+
+bsub < OpenMPlus_job_128_4.lsf
+
+bsub < OpenMPlus_job_128_8.lsf
+
+bsub < OpenMPlus_job_128_16.lsf
+
+
+
+gcc -std=c++11 -O3 -mcpu=power8 -fopenmp OpenMPlus.cpp -o OpenMPlus_job_256
+
+
+bsub < OpenMPlus_job_256_1.lsf
+
+bsub < OpenMPlus_job_256_2.lsf
+
+bsub < OpenMPlus_job_256_4.lsf
+
+bsub < OpenMPlus_job_256_8.lsf
+
+bsub < OpenMPlus_job_256_16.lsf
+
+bsub < OpenMPlus_job_256_32.lsf
