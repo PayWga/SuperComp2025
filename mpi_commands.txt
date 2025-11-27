@@ -1,0 +1,46 @@
+module add SpectrumMPI
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_1
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_2
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_4
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_8
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_16
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_128_32
+
+mpisubmit.pl -p 1 ./MPI_job_128_1
+
+mpisubmit.pl -p 2 ./MPI_job_128_2
+
+mpisubmit.pl -p 4 ./MPI_job_128_4
+
+mpisubmit.pl -p 8 ./MPI_job_128_8
+
+mpisubmit.pl -p 16 ./MPI_job_128_16
+
+mpisubmit.pl -p 32 ./MPI_job_128_32
+
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_256_1
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_256_4
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_256_8
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_256_16
+
+mpicxx -std=c++11 -O3 -mcpu=power8 MPI.cpp -o MPI_job_256_32
+
+mpisubmit.pl -p 1 ./MPI_job_256_1
+
+mpisubmit.pl -p 4 ./MPI_job_256_4
+
+mpisubmit.pl -p 8 ./MPI_job_256_8
+
+mpisubmit.pl -p 16 ./MPI_job_256_16
+
+mpisubmit.pl -p 32 ./MPI_job_256_32
