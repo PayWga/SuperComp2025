@@ -1,0 +1,10 @@
+#BSUB -J "solver_gpu"
+#BSUB -o "solver_gpu_8.%J.out"    
+#BSUB -e "solver_gpu_8.%J.err"    
+#BSUB -n 8                      
+#BSUB -R "span[ptile=4]"        
+#BSUB -W 00:15                  
+#BSUB -gpu "num=2"              
+
+
+OMP_NUM_THREADS=1 mpiexec ./solver_gpu

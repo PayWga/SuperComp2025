@@ -1,0 +1,6 @@
+make
+
+bsub < cuda_1.lsf
+bsub < cuda_2.lsf
+bsub < cuda_4.lsf
+bsub < cuda_8.lsf
