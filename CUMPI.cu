@@ -1,13 +1,20 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 #include <iostream>
 #include <iomanip>
-#include <vector>
 #include <cmath>
-#include <sched.h>
+#include <vector>
 #include <unistd.h>
+#include <sched.h>
 
 using namespace std;
+
+#define PI 3.14159265358979323846
 
 #define CUDA_CHECK(call) \
     do { \
@@ -18,62 +25,65 @@ using namespace std;
         } \
     } while (0)
 
-#define PI 3.14159265358979323846
+#if __CUDA_ARCH__ >= 350
+#define LDG(x) __ldg(&(x))
+#else
+#define LDG(x) (x)
+#endif
 
 void set_cpu_affinity(int rank) {
     int smt_stride = 8; 
     int num_logical_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (num_logical_cpus < 1) return;
-
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    
     int physical_core_id = rank % (num_logical_cpus / smt_stride);
     int target_cpu = physical_core_id * smt_stride;
-
     CPU_SET(target_cpu, &cpuset);
     sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
 }
 
-__device__ double atomicMaxDouble(double* address, double val) {
-    unsigned long long* address_as_ull = (unsigned long long*)address;
-    unsigned long long old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        double old_val = __longlong_as_double(assumed);
-        double max_val = fmax(val, old_val);
-        old = atomicCAS(address_as_ull, assumed, __double_as_longlong(max_val));
-    } while (assumed != old);
-    return __longlong_as_double(old);
-}
-
-__device__ inline int get_idx(int i, int j, int k, int nyg, int nzg) {
+__device__ __host__ inline int get_idx(int i, int j, int k, int nyg, int nzg) {
     return (i * nyg + j) * nzg + k;
 }
 
-__device__ double u_analytic_dev(double x, double y, double z, double t, 
-                                 double Lx, double Ly, double Lz, double a_t) {
-    return sin(3.0 * PI * x / Lx) * sin(2.0 * PI * y / Ly) * sin(2.0 * PI * z / Lz) * cos(a_t * t + 4.0 * PI);
+__global__ void precompute_trig_kernel(double* __restrict__ sx, double* __restrict__ sy, double* __restrict__ sz, 
+                                       int nx_loc, int ny_loc, int nz_loc,
+                                       int i_start, int j_start, int k_start,
+                                       double hx, double hy, double hz,
+                                       double Lx, double Ly, double Lz) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    if (idx <= nx_loc) {
+        double x = (i_start + idx - 1) * hx;
+        sx[idx] = sin(3.0 * PI * x / Lx);
+    }
+    if (idx <= ny_loc) {
+        double y = (j_start + idx - 1) * hy;
+        sy[idx] = sin(2.0 * PI * y / Ly);
+    }
+    if (idx <= nz_loc) {
+        double z = (k_start + idx - 1) * hz;
+        sz[idx] = sin(2.0 * PI * z / Lz);
+    }
 }
 
-__global__ void init_kernel(double* u, int nx_loc, int ny_loc, int nz_loc,
-                            int i_start, int j_start, int k_start,
-                            double hx, double hy, double hz,
-                            double Lx, double Ly, double Lz, double a_t,
+__global__ void init_kernel(double* __restrict__ u, 
+                            const double* __restrict__ sx, 
+                            const double* __restrict__ sy, 
+                            const double* __restrict__ sz,
+                            int nx_loc, int ny_loc, int nz_loc,
                             int nyg, int nzg) {
     int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
     int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
-        double x = (i_start + i - 1) * hx;
-        double y = (j_start + j - 1) * hy;
-        double z = (k_start + k - 1) * hz;
-        u[get_idx(i, j, k, nyg, nzg)] = u_analytic_dev(x, y, z, 0.0, Lx, Ly, Lz, a_t);
+        u[get_idx(i, j, k, nyg, nzg)] = LDG(sx[i]) * LDG(sy[j]) * LDG(sz[k]); 
     }
 }
 
-__global__ void step1_kernel(double* u_curr, const double* u_prev, 
+__global__ void step1_kernel(double* __restrict__ u_curr, 
+                             const double* __restrict__ u_prev, 
                              int nx_loc, int ny_loc, int nz_loc,
                              double a2, double tau, double hx, double hy, double hz,
                              int nyg, int nzg) {
@@ -83,15 +93,19 @@ __global__ void step1_kernel(double* u_curr, const double* u_prev,
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
         int idx = get_idx(i, j, k, nyg, nzg);
-        double center = u_prev[idx];
-        double lap = (u_prev[get_idx(i-1, j, k, nyg, nzg)] - 2.0*center + u_prev[get_idx(i+1, j, k, nyg, nzg)]) / (hx*hx) +
-                     (u_prev[get_idx(i, j-1, k, nyg, nzg)] - 2.0*center + u_prev[get_idx(i, j+1, k, nyg, nzg)]) / (hy*hy) +
-                     (u_prev[get_idx(i, j, k-1, nyg, nzg)] - 2.0*center + u_prev[get_idx(i, j, k+1, nyg, nzg)]) / (hz*hz);
+        double center = LDG(u_prev[idx]);
+        
+        double lap = (LDG(u_prev[get_idx(i-1, j, k, nyg, nzg)]) - 2.0*center + LDG(u_prev[get_idx(i+1, j, k, nyg, nzg)])) / (hx*hx) +
+                     (LDG(u_prev[get_idx(i, j-1, k, nyg, nzg)]) - 2.0*center + LDG(u_prev[get_idx(i, j+1, k, nyg, nzg)])) / (hy*hy) +
+                     (LDG(u_prev[get_idx(i, j, k-1, nyg, nzg)]) - 2.0*center + LDG(u_prev[get_idx(i, j, k+1, nyg, nzg)])) / (hz*hz);
+        
         u_curr[idx] = center + 0.5 * a2 * tau * tau * lap;
     }
 }
 
-__global__ void step_kernel(double* u_next, const double* u_curr, const double* u_prev,
+__global__ void step_kernel(double* __restrict__ u_next, 
+                            const double* __restrict__ u_curr, 
+                            const double* __restrict__ u_prev,
                             int nx_loc, int ny_loc, int nz_loc,
                             double a2, double tau, double hx, double hy, double hz,
                             int nyg, int nzg) {
@@ -101,15 +115,17 @@ __global__ void step_kernel(double* u_next, const double* u_curr, const double* 
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
         int idx = get_idx(i, j, k, nyg, nzg);
-        double center = u_curr[idx];
-        double lap = (u_curr[get_idx(i-1, j, k, nyg, nzg)] - 2.0*center + u_curr[get_idx(i+1, j, k, nyg, nzg)]) / (hx*hx) +
-                     (u_curr[get_idx(i, j-1, k, nyg, nzg)] - 2.0*center + u_curr[get_idx(i, j+1, k, nyg, nzg)]) / (hy*hy) +
-                     (u_curr[get_idx(i, j, k-1, nyg, nzg)] - 2.0*center + u_curr[get_idx(i, j, k+1, nyg, nzg)]) / (hz*hz);
-        u_next[idx] = 2.0*center - u_prev[idx] + a2 * tau * tau * lap;
+        double center = LDG(u_curr[idx]);
+        
+        double lap = (LDG(u_curr[get_idx(i-1, j, k, nyg, nzg)]) - 2.0*center + LDG(u_curr[get_idx(i+1, j, k, nyg, nzg)])) / (hx*hx) +
+                     (LDG(u_curr[get_idx(i, j-1, k, nyg, nzg)]) - 2.0*center + LDG(u_curr[get_idx(i, j+1, k, nyg, nzg)])) / (hy*hy) +
+                     (LDG(u_curr[get_idx(i, j, k-1, nyg, nzg)]) - 2.0*center + LDG(u_curr[get_idx(i, j, k+1, nyg, nzg)])) / (hz*hz);
+        
+        u_next[idx] = 2.0*center - LDG(u_prev[idx]) + a2 * tau * tau * lap;
     }
 }
 
-__global__ void boundary_kernel(double* u, int nx_loc, int ny_loc, int nz_loc, 
+__global__ void boundary_kernel(double* __restrict__ u, int nx_loc, int ny_loc, int nz_loc, 
                                 int i_start, int nx_global, int nyg, int nzg) {
     int j = blockIdx.x * blockDim.x + threadIdx.x; 
     int k = blockIdx.y * blockDim.y + threadIdx.y; 
@@ -126,29 +142,35 @@ __global__ void boundary_kernel(double* u, int nx_loc, int ny_loc, int nz_loc,
     }
 }
 
-__global__ void error_kernel(const double* u, double* max_err_dev, double t,
-                             int nx_loc, int ny_loc, int nz_loc,
-                             int i_start, int j_start, int k_start,
-                             double hx, double hy, double hz,
-                             double Lx, double Ly, double Lz, double a_t,
-                             int nyg, int nzg) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
-    int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-    int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+struct ErrorFunctor {
+    const double *u, *sx, *sy, *sz;
+    int nx_loc, ny_loc, nz_loc, nyg, nzg;
+    double t_factor;
 
-    if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
-        double x = (i_start + i - 1) * hx;
-        double y = (j_start + j - 1) * hy;
-        double z = (k_start + k - 1) * hz;
-        double ua = u_analytic_dev(x, y, z, t, Lx, Ly, Lz, a_t);
-        double val = u[get_idx(i, j, k, nyg, nzg)];
-        atomicMaxDouble(max_err_dev, fabs(val - ua));
+    ErrorFunctor(const double* _u, const double* _sx, const double* _sy, const double* _sz,
+                 int _nx, int _ny, int _nz, int _nyg, int _nzg, double _t_factor)
+        : u(_u), sx(_sx), sy(_sy), sz(_sz), 
+          nx_loc(_nx), ny_loc(_ny), nz_loc(_nz), nyg(_nyg), nzg(_nzg), t_factor(_t_factor) {}
+
+    __host__ __device__
+    double operator()(const int& idx_linear) const {
+        int slice_size = ny_loc * nz_loc;
+        int i_local = idx_linear / slice_size + 1;
+        int rem = idx_linear % slice_size;
+        int j_local = rem / nz_loc + 1;
+        int k_local = rem % nz_loc + 1;
+
+        double spatial = sx[i_local] * sy[j_local] * sz[k_local];
+        double ua = spatial * t_factor;
+
+        int grid_idx = (i_local * nyg + j_local) * nzg + k_local;
+        double val = u[grid_idx];
+
+        return fabs(val - ua);
     }
-}
+};
 
-__global__ void pack_kernel(const double* u, double* buf, 
-                            int face_dim1, int face_dim2,
-                            int fix_dim_idx, int dim_code, int nyg, int nzg) {
+__global__ void pack_kernel(const double* __restrict__ u, double* __restrict__ buf, int face_dim1, int face_dim2, int fix_dim_idx, int dim_code, int nyg, int nzg) {
     int d1 = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int d2 = blockIdx.y * blockDim.y + threadIdx.y + 1;
     if (d1 <= face_dim1 && d2 <= face_dim2) {
@@ -161,9 +183,7 @@ __global__ void pack_kernel(const double* u, double* buf,
     }
 }
 
-__global__ void unpack_kernel(double* u, const double* buf, 
-                              int face_dim1, int face_dim2,
-                              int fix_dim_idx, int dim_code, int nyg, int nzg) {
+__global__ void unpack_kernel(double* __restrict__ u, const double* __restrict__ buf, int face_dim1, int face_dim2, int fix_dim_idx, int dim_code, int nyg, int nzg) {
     int d1 = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int d2 = blockIdx.y * blockDim.y + threadIdx.y + 1;
     if (d1 <= face_dim1 && d2 <= face_dim2) {
@@ -190,118 +210,68 @@ struct HaloCtx {
 void run_halo_exchange(double* d_arr, HaloCtx& ctx, 
                        float& time_calc, float& time_copy, float& time_comm,
                        cudaEvent_t& start, cudaEvent_t& stop) {
-    
     float t_k, t_c, t_m;
-
-    cudaEventRecord(start);
+    
+    cudaEventRecord(start); 
     pack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_sb_x, ctx.ny_loc, ctx.nz_loc, ctx.nx_loc, 0, ctx.nyg, ctx.nzg);
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
+    
     cudaEventRecord(start); cudaMemcpy(ctx.h_sb_x, ctx.d_sb_x, ctx.sz_x, cudaMemcpyDeviceToHost);
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
 
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.right, 0,
+    cudaEventRecord(start); 
+    MPI_Sendrecv(ctx.h_sb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.right, 0, 
                  ctx.h_rb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.left, 0, ctx.comm, MPI_STATUS_IGNORE);
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
 
     if (ctx.left != MPI_PROC_NULL) {
-        cudaEventRecord(start); cudaMemcpy(ctx.d_rb_x, ctx.h_rb_x, ctx.sz_x, cudaMemcpyHostToDevice);
-        cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-        
-        cudaEventRecord(start);
-        unpack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_rb_x, ctx.ny_loc, ctx.nz_loc, 0, 0, ctx.nyg, ctx.nzg);
-        cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+        cudaEventRecord(start); cudaMemcpy(ctx.d_rb_x, ctx.h_rb_x, ctx.sz_x, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+        cudaEventRecord(start); unpack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_rb_x, ctx.ny_loc, ctx.nz_loc, 0, 0, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
     }
 
-    cudaEventRecord(start);
-    pack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_sb_x, ctx.ny_loc, ctx.nz_loc, 1, 0, ctx.nyg, ctx.nzg);
+    cudaEventRecord(start); pack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_sb_x, ctx.ny_loc, ctx.nz_loc, 1, 0, ctx.nyg, ctx.nzg); 
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
+    
     cudaEventRecord(start); cudaMemcpy(ctx.h_sb_x, ctx.d_sb_x, ctx.sz_x, cudaMemcpyDeviceToHost);
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.left, 1,
+    
+    cudaEventRecord(start); 
+    MPI_Sendrecv(ctx.h_sb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.left, 1, 
                  ctx.h_rb_x, ctx.ny_loc*ctx.nz_loc, MPI_DOUBLE, ctx.right, 1, ctx.comm, MPI_STATUS_IGNORE);
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
 
     if (ctx.right != MPI_PROC_NULL) {
-        cudaEventRecord(start); cudaMemcpy(ctx.d_rb_x, ctx.h_rb_x, ctx.sz_x, cudaMemcpyHostToDevice);
-        cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-        cudaEventRecord(start);
-        unpack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_rb_x, ctx.ny_loc, ctx.nz_loc, ctx.nx_loc+1, 0, ctx.nyg, ctx.nzg);
-        cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+        cudaEventRecord(start); cudaMemcpy(ctx.d_rb_x, ctx.h_rb_x, ctx.sz_x, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+        cudaEventRecord(start); unpack_kernel<<<ctx.grid_x, ctx.block2d>>>(d_arr, ctx.d_rb_x, ctx.ny_loc, ctx.nz_loc, ctx.nx_loc+1, 0, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
     }
 
-    cudaEventRecord(start); pack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_sb_y, ctx.nx_loc, ctx.nz_loc, ctx.ny_loc, 1, ctx.nyg, ctx.nzg);
+    cudaEventRecord(start); pack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_sb_y, ctx.nx_loc, ctx.nz_loc, ctx.ny_loc, 1, ctx.nyg, ctx.nzg); 
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_y, ctx.d_sb_y, ctx.sz_y, cudaMemcpyDeviceToHost); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); MPI_Sendrecv(ctx.h_sb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.up, 2, ctx.h_rb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.down, 2, ctx.comm, MPI_STATUS_IGNORE); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
+    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_y, ctx.h_rb_y, ctx.sz_y, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); unpack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_rb_y, ctx.nx_loc, ctx.nz_loc, 0, 1, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
 
-    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_y, ctx.d_sb_y, ctx.sz_y, cudaMemcpyDeviceToHost);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.up, 2, 
-                 ctx.h_rb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.down, 2, ctx.comm, MPI_STATUS_IGNORE);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_y, ctx.h_rb_y, ctx.sz_y, cudaMemcpyHostToDevice);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start); unpack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_rb_y, ctx.nx_loc, ctx.nz_loc, 0, 1, ctx.nyg, ctx.nzg);
+    cudaEventRecord(start); pack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_sb_y, ctx.nx_loc, ctx.nz_loc, 1, 1, ctx.nyg, ctx.nzg); 
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_y, ctx.d_sb_y, ctx.sz_y, cudaMemcpyDeviceToHost); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); MPI_Sendrecv(ctx.h_sb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.down, 3, ctx.h_rb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.up, 3, ctx.comm, MPI_STATUS_IGNORE); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
+    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_y, ctx.h_rb_y, ctx.sz_y, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); unpack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_rb_y, ctx.nx_loc, ctx.nz_loc, ctx.ny_loc+1, 1, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
 
-    cudaEventRecord(start); pack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_sb_y, ctx.nx_loc, ctx.nz_loc, 1, 1, ctx.nyg, ctx.nzg);
+    cudaEventRecord(start); pack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_sb_z, ctx.nx_loc, ctx.ny_loc, ctx.nz_loc, 2, ctx.nyg, ctx.nzg); 
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_z, ctx.d_sb_z, ctx.sz_z, cudaMemcpyDeviceToHost); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); MPI_Sendrecv(ctx.h_sb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.front, 4, ctx.h_rb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.back, 4, ctx.comm, MPI_STATUS_IGNORE); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
+    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_z, ctx.h_rb_z, ctx.sz_z, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); unpack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_rb_z, ctx.nx_loc, ctx.ny_loc, 0, 2, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
 
-    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_y, ctx.d_sb_y, ctx.sz_y, cudaMemcpyDeviceToHost);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.down, 3, 
-                 ctx.h_rb_y, ctx.nx_loc*ctx.nz_loc, MPI_DOUBLE, ctx.up, 3, ctx.comm, MPI_STATUS_IGNORE);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_y, ctx.h_rb_y, ctx.sz_y, cudaMemcpyHostToDevice);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start); unpack_kernel<<<ctx.grid_y, ctx.block2d>>>(d_arr, ctx.d_rb_y, ctx.nx_loc, ctx.nz_loc, ctx.ny_loc+1, 1, ctx.nyg, ctx.nzg);
+    cudaEventRecord(start); pack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_sb_z, ctx.nx_loc, ctx.ny_loc, 1, 2, ctx.nyg, ctx.nzg); 
     cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
-    cudaEventRecord(start); pack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_sb_z, ctx.nx_loc, ctx.ny_loc, ctx.nz_loc, 2, ctx.nyg, ctx.nzg);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_z, ctx.d_sb_z, ctx.sz_z, cudaMemcpyDeviceToHost);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.front, 4, 
-                 ctx.h_rb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.back, 4, ctx.comm, MPI_STATUS_IGNORE);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_z, ctx.h_rb_z, ctx.sz_z, cudaMemcpyHostToDevice);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start); unpack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_rb_z, ctx.nx_loc, ctx.ny_loc, 0, 2, ctx.nyg, ctx.nzg);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
-    cudaEventRecord(start); pack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_sb_z, ctx.nx_loc, ctx.ny_loc, 1, 2, ctx.nyg, ctx.nzg);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_z, ctx.d_sb_z, ctx.sz_z, cudaMemcpyDeviceToHost);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start);
-    MPI_Sendrecv(ctx.h_sb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.back, 5, 
-                 ctx.h_rb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.front, 5, ctx.comm, MPI_STATUS_IGNORE);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
-
-    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_z, ctx.h_rb_z, ctx.sz_z, cudaMemcpyHostToDevice);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
-
-    cudaEventRecord(start); unpack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_rb_z, ctx.nx_loc, ctx.ny_loc, ctx.nz_loc+1, 2, ctx.nyg, ctx.nzg);
-    cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
+    cudaEventRecord(start); cudaMemcpy(ctx.h_sb_z, ctx.d_sb_z, ctx.sz_z, cudaMemcpyDeviceToHost); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); MPI_Sendrecv(ctx.h_sb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.back, 5, ctx.h_rb_z, ctx.nx_loc*ctx.ny_loc, MPI_DOUBLE, ctx.front, 5, ctx.comm, MPI_STATUS_IGNORE); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_m, start, stop); time_comm += t_m;
+    cudaEventRecord(start); cudaMemcpy(ctx.d_rb_z, ctx.h_rb_z, ctx.sz_z, cudaMemcpyHostToDevice); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_c, start, stop); time_copy += t_c;
+    cudaEventRecord(start); unpack_kernel<<<ctx.grid_z, ctx.block2d>>>(d_arr, ctx.d_rb_z, ctx.nx_loc, ctx.ny_loc, ctx.nz_loc+1, 2, ctx.nyg, ctx.nzg); cudaEventRecord(stop); cudaEventSynchronize(stop); cudaEventElapsedTime(&t_k, start, stop); time_calc += t_k;
 }
 
 int main(int argc, char** argv) {
@@ -315,24 +285,18 @@ int main(int argc, char** argv) {
 
     int num_devices = 0;
     cudaGetDeviceCount(&num_devices);
-    if (num_devices == 0) {
-        if (rank == 0) cerr << "Error: No GPUs detected. Check LSF script includes -gpu flag." << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
     cudaSetDevice(rank % num_devices);
 
-    double Lx = 1.0, Ly = 1.0, Lz = 1.0;
-    size_t N = 256; 
+    size_t N = 512; 
     size_t Nx_global = N + 1;
     size_t Ny_global = N;
     size_t Nz_global = N;
 
+    double Lx = 1.0, Ly = 1.0, Lz = 1.0;
     double hx = Lx / N, hy = Ly / N, hz = Lz / N;
     double a_t = 2.0 * PI;
-    double denom = (9.0/(Lx*Lx)) + (4.0/(Ly*Ly)) + (4.0/(Lz*Lz));
-    double a2 = 4.0 / denom;
-    double inv_h_sq = 1.0/(hx*hx) + 1.0/(hy*hy) + 1.0/(hz*hz);
-    double tau = 0.8 / (sqrt(a2) * sqrt(inv_h_sq)); 
+    double a2 = 4.0 / ((9.0/(Lx*Lx)) + (4.0/(Ly*Ly)) + (4.0/(Lz*Lz)));
+    double tau = 0.8 / (sqrt(a2) * sqrt(1.0/(hx*hx) + 1.0/(hy*hy) + 1.0/(hz*hz))); 
     size_t Nt = 50;
 
     int dims[3] = {0, 0, 0};
@@ -368,93 +332,99 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         cout << fixed << setprecision(8);
-        cout << "MPI+CUDA Variant 4. Grid: " << N << "^3. Procs: " << nprocs << " (" << dims[0] << "x" << dims[1] << "x" << dims[2] << ")." << endl;
-        cout << "Configuration: a^2=" << a2 << ", tau=" << tau << endl;
+        cout << "MPI+CUDA+Thrust Implementation. Grid: " << N << "^3. Procs: " << nprocs << endl;
     }
 
-    double *d_u_prev, *d_u_curr, *d_u_next, *d_error;
+    double *d_u_prev, *d_u_curr, *d_u_next;
     CUDA_CHECK(cudaMalloc(&d_u_prev, total_elements * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_u_curr, total_elements * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_u_next, total_elements * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_error, sizeof(double)));
+    
+    double *d_sx, *d_sy, *d_sz;
+    CUDA_CHECK(cudaMalloc(&d_sx, (nx_loc + 2) * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_sy, (ny_loc + 2) * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_sz, (nz_loc + 2) * sizeof(double)));
 
     HaloCtx ctx;
     ctx.nx_loc = nx_loc; ctx.ny_loc = ny_loc; ctx.nz_loc = nz_loc;
     ctx.nyg = nyg; ctx.nzg = nzg;
     ctx.comm = cart_comm;
-
     ctx.sz_x = ny_loc * nz_loc * sizeof(double);
     ctx.sz_y = nx_loc * nz_loc * sizeof(double);
     ctx.sz_z = nx_loc * ny_loc * sizeof(double);
-
     CUDA_CHECK(cudaMalloc(&ctx.d_sb_x, ctx.sz_x)); CUDA_CHECK(cudaMalloc(&ctx.d_rb_x, ctx.sz_x));
     CUDA_CHECK(cudaMalloc(&ctx.d_sb_y, ctx.sz_y)); CUDA_CHECK(cudaMalloc(&ctx.d_rb_y, ctx.sz_y));
     CUDA_CHECK(cudaMalloc(&ctx.d_sb_z, ctx.sz_z)); CUDA_CHECK(cudaMalloc(&ctx.d_rb_z, ctx.sz_z));
-
     ctx.h_sb_x = (double*)malloc(ctx.sz_x); ctx.h_rb_x = (double*)malloc(ctx.sz_x);
     ctx.h_sb_y = (double*)malloc(ctx.sz_y); ctx.h_rb_y = (double*)malloc(ctx.sz_y);
     ctx.h_sb_z = (double*)malloc(ctx.sz_z); ctx.h_rb_z = (double*)malloc(ctx.sz_z);
-
     MPI_Cart_shift(cart_comm, 0, 1, &ctx.left, &ctx.right);
     MPI_Cart_shift(cart_comm, 1, 1, &ctx.down, &ctx.up);   
     MPI_Cart_shift(cart_comm, 2, 1, &ctx.back, &ctx.front); 
 
     dim3 block(8, 8, 8);
     dim3 grid((nx_loc + 7)/8, (ny_loc + 7)/8, (nz_loc + 7)/8);
-    
     ctx.block2d = dim3(16, 16);
     ctx.grid_x = dim3((ny_loc+15)/16, (nz_loc+15)/16);
     ctx.grid_y = dim3((nx_loc+15)/16, (nz_loc+15)/16);
     ctx.grid_z = dim3((nx_loc+15)/16, (ny_loc+15)/16);
-
     dim3 bound_grid((nyg+15)/16, (nzg+15)/16);
+    dim3 grid_1d((max(nx_loc, max(ny_loc, nz_loc)) + 255) / 256);
 
     float time_calc = 0.0f, time_copy = 0.0f, time_comm = 0.0f, time_init = 0.0f;
-    cudaEvent_t start, stop, e_start, e_stop;
+    cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
-    cudaEventCreate(&e_start); cudaEventCreate(&e_stop);
 
     cudaEventRecord(start);
-    init_kernel<<<grid, block>>>(d_u_prev, nx_loc, ny_loc, nz_loc, i_start, j_start, k_start, 
-                                 hx, hy, hz, Lx, Ly, Lz, a_t, nyg, nzg);
+    precompute_trig_kernel<<<grid_1d, 256>>>(d_sx, d_sy, d_sz, nx_loc, ny_loc, nz_loc, i_start, j_start, k_start, hx, hy, hz, Lx, Ly, Lz);
+    init_kernel<<<grid, block>>>(d_u_prev, d_sx, d_sy, d_sz, nx_loc, ny_loc, nz_loc, nyg, nzg);
     boundary_kernel<<<bound_grid, ctx.block2d>>>(d_u_prev, nx_loc, ny_loc, nz_loc, i_start, Nx_global, nyg, nzg);
+    
+    run_halo_exchange(d_u_prev, ctx, time_calc, time_copy, time_comm, start, stop);
+    
+    step1_kernel<<<grid, block>>>(d_u_curr, d_u_prev, nx_loc, ny_loc, nz_loc, a2, tau, hx, hy, hz, nyg, nzg);
+    boundary_kernel<<<bound_grid, ctx.block2d>>>(d_u_curr, nx_loc, ny_loc, nz_loc, i_start, Nx_global, nyg, nzg);
+
     cudaEventRecord(stop); cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time_init, start, stop);
 
-    run_halo_exchange(d_u_prev, ctx, time_calc, time_copy, time_comm, e_start, e_stop);
-
-    cudaEventRecord(start);
-    step1_kernel<<<grid, block>>>(d_u_curr, d_u_prev, nx_loc, ny_loc, nz_loc, a2, tau, hx, hy, hz, nyg, nzg);
-    boundary_kernel<<<bound_grid, ctx.block2d>>>(d_u_curr, nx_loc, ny_loc, nz_loc, i_start, Nx_global, nyg, nzg);
-    cudaEventRecord(stop); cudaEventSynchronize(stop);
-    float t_step; cudaEventElapsedTime(&t_step, start, stop); time_calc += t_step;
-
     double global_max_err = 0.0;
+    int calc_size = nx_loc * ny_loc * nz_loc;
 
     for (size_t n = 2; n <= Nt; ++n) {
         double t_physical = n * tau;
         
-        run_halo_exchange(d_u_curr, ctx, time_calc, time_copy, time_comm, e_start, e_stop);
+        run_halo_exchange(d_u_curr, ctx, time_calc, time_copy, time_comm, start, stop);
 
         cudaEventRecord(start);
         step_kernel<<<grid, block>>>(d_u_next, d_u_curr, d_u_prev, nx_loc, ny_loc, nz_loc, a2, tau, hx, hy, hz, nyg, nzg);
         boundary_kernel<<<bound_grid, ctx.block2d>>>(d_u_next, nx_loc, ny_loc, nz_loc, i_start, Nx_global, nyg, nzg);
+        cudaEventRecord(stop); cudaEventSynchronize(stop);
+        float t_step; cudaEventElapsedTime(&t_step, start, stop); time_calc += t_step;
+
+        cudaEventRecord(start);
         
-        double zero = 0.0;
-        cudaMemcpy(d_error, &zero, sizeof(double), cudaMemcpyHostToDevice);
-        error_kernel<<<grid, block>>>(d_u_next, d_error, t_physical, nx_loc, ny_loc, nz_loc, 
-                                      i_start, j_start, k_start, hx, hy, hz, Lx, Ly, Lz, a_t, nyg, nzg);
+        double t_factor = cos(a_t * t_physical + 4.0 * PI);
+        
+        ErrorFunctor func(d_u_next, d_sx, d_sy, d_sz, nx_loc, ny_loc, nz_loc, nyg, nzg, t_factor);
+        
+        double local_max_err = thrust::transform_reduce(
+            thrust::device,
+            thrust::counting_iterator<int>(0),
+            thrust::counting_iterator<int>(calc_size),
+            func,
+            0.0,
+            thrust::maximum<double>()
+        );
+        
         cudaEventRecord(stop); cudaEventSynchronize(stop);
         cudaEventElapsedTime(&t_step, start, stop); time_calc += t_step;
 
-        double local_err;
-        cudaMemcpy(&local_err, d_error, sizeof(double), cudaMemcpyDeviceToHost);
-        
-        cudaEventRecord(e_start);
+        cudaEventRecord(start);
         double proc_err = 0.0;
-        MPI_Reduce(&local_err, &proc_err, 1, MPI_DOUBLE, MPI_MAX, 0, cart_comm);
-        cudaEventRecord(e_stop); cudaEventSynchronize(e_stop); 
-        float t_red; cudaEventElapsedTime(&t_red, e_start, e_stop); time_comm += t_red;
+        MPI_Reduce(&local_max_err, &proc_err, 1, MPI_DOUBLE, MPI_MAX, 0, cart_comm);
+        cudaEventRecord(stop); cudaEventSynchronize(stop);
+        float t_red; cudaEventElapsedTime(&t_red, start, stop); time_comm += t_red;
 
         if (rank == 0) {
             if (proc_err > global_max_err) global_max_err = proc_err;
@@ -468,17 +438,17 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         cout << endl << "--- RESULTS ---" << endl;
         cout << "Final Max Error: " << global_max_err << endl;
-        
         cout << endl << "--- TIMING (Seconds) ---" << endl;
-        cout << "Initialization:                        " << time_init / 1000.0 << endl;
-        cout << "Parallel Cycles (Kernels+Pack+Unpack): " << time_calc / 1000.0 << endl;
-        cout << "Data Copy (Host <-> Device):           " << time_copy / 1000.0 << endl;
-        cout << "Communication (MPI):                   " << time_comm / 1000.0 << endl;
-        cout << "Total Halo Overhead:                   " << (time_copy + time_comm) / 1000.0 << endl;
-        cout << "Total Time:                            " << (time_init + time_calc + time_copy + time_comm) / 1000.0 << endl;
+        cout << "Initialization:                         " << time_init / 1000.0 << endl;
+        cout << "Parallel Cycles (Kernels+Halo+Thrust):  " << time_calc / 1000.0 << endl;
+        cout << "Data Copy (Host <-> Device):            " << time_copy / 1000.0 << endl;
+        cout << "Communication (MPI):                    " << time_comm / 1000.0 << endl;
+        cout << "Total Halo Overhead:                    " << (time_copy + time_comm) / 1000.0 << endl;
+        cout << "Total Time:                             " << (time_init + time_calc + time_copy + time_comm) / 1000.0 << endl;
     }
 
-    cudaFree(d_u_prev); cudaFree(d_u_curr); cudaFree(d_u_next); cudaFree(d_error);
+    cudaFree(d_u_prev); cudaFree(d_u_curr); cudaFree(d_u_next);
+    cudaFree(d_sx); cudaFree(d_sy); cudaFree(d_sz); 
     cudaFree(ctx.d_sb_x); cudaFree(ctx.d_rb_x); cudaFree(ctx.d_sb_y); cudaFree(ctx.d_rb_y); cudaFree(ctx.d_sb_z); cudaFree(ctx.d_rb_z);
     free(ctx.h_sb_x); free(ctx.h_rb_x); free(ctx.h_sb_y); free(ctx.h_rb_y); free(ctx.h_sb_z); free(ctx.h_rb_z);
 
