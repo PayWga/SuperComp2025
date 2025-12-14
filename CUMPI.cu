@@ -73,9 +73,9 @@ __global__ void init_kernel(double* __restrict__ u,
                             const double* __restrict__ sz,
                             int nx_loc, int ny_loc, int nz_loc,
                             int nyg, int nzg) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-    int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+    int i = blockIdx.z * blockDim.z + threadIdx.z + 1;
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
         u[get_idx(i, j, k, nyg, nzg)] = LDG(sx[i]) * LDG(sy[j]) * LDG(sz[k]); 
@@ -87,9 +87,9 @@ __global__ void step1_kernel(double* __restrict__ u_curr,
                              int nx_loc, int ny_loc, int nz_loc,
                              double a2, double tau, double hx, double hy, double hz,
                              int nyg, int nzg) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-    int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+    int i = blockIdx.z * blockDim.z + threadIdx.z + 1;
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
         int idx = get_idx(i, j, k, nyg, nzg);
@@ -107,9 +107,9 @@ __global__ void step_kernel(double* __restrict__ u_next,
                             int nx_loc, int ny_loc, int nz_loc,
                             double a2, double tau, double hx, double hy, double hz,
                             int nyg, int nzg) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
-    int k = blockIdx.z * blockDim.z + threadIdx.z + 1;
+    int i = blockIdx.z * blockDim.z + threadIdx.z + 1;
 
     if (i <= nx_loc && j <= ny_loc && k <= nz_loc) {
         int idx = get_idx(i, j, k, nyg, nzg);
@@ -123,8 +123,9 @@ __global__ void step_kernel(double* __restrict__ u_next,
 
 __global__ void boundary_kernel(double* __restrict__ u, int nx_loc, int ny_loc, int nz_loc, 
                                 int i_start, int nx_global, int nyg, int nzg) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x; 
-    int k = blockIdx.y * blockDim.y + threadIdx.y; 
+    int k = blockIdx.x * blockDim.x + threadIdx.x; 
+    int j = blockIdx.y * blockDim.y + threadIdx.y; 
+
     if (j < nyg && k < nzg) {
         if (i_start == 0) {
             u[get_idx(0, j, k, nyg, nzg)] = 0.0;
@@ -149,11 +150,10 @@ struct ErrorFunctor {
 
     __host__ __device__
     double operator()(const int& idx_linear) const {
-        int slice_size = ny_loc * nz_loc;
-        int i_local = idx_linear / slice_size + 1;
-        int rem = idx_linear % slice_size;
-        int j_local = rem / nz_loc + 1;
-        int k_local = rem % nz_loc + 1;
+        int k_local = idx_linear % nz_loc + 1;
+        int rem = idx_linear / nz_loc;
+        int j_local = rem % ny_loc + 1;
+        int i_local = rem / ny_loc + 1;
 
         double spatial = sx[i_local] * sy[j_local] * sz[k_local];
         double ua = spatial * t_factor;
@@ -165,21 +165,25 @@ struct ErrorFunctor {
 };
 
 __global__ void pack_kernel(const double* __restrict__ u, double* __restrict__ buf, int face_dim1, int face_dim2, int fix_dim_idx, int dim_code, int nyg, int nzg) {
-    int d1 = blockIdx.x * blockDim.x + threadIdx.x + 1;
-    int d2 = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    int d2 = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int d1 = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    
     if (d1 <= face_dim1 && d2 <= face_dim2) {
         int idx_dst = (d1-1) * face_dim2 + (d2-1);
         int idx_src = 0;
+        
         if (dim_code == 0) idx_src = get_idx(fix_dim_idx, d1, d2, nyg, nzg);
         else if (dim_code == 1) idx_src = get_idx(d1, fix_dim_idx, d2, nyg, nzg);
         else idx_src = get_idx(d1, d2, fix_dim_idx, nyg, nzg);
+        
         buf[idx_dst] = u[idx_src];
     }
 }
 
 __global__ void unpack_kernel(double* __restrict__ u, const double* __restrict__ buf, int face_dim1, int face_dim2, int fix_dim_idx, int dim_code, int nyg, int nzg) {
-    int d1 = blockIdx.x * blockDim.x + threadIdx.x + 1;
-    int d2 = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    int d2 = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int d1 = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    
     if (d1 <= face_dim1 && d2 <= face_dim2) {
         int idx_src = (d1-1) * face_dim2 + (d2-1);
         int idx_dst = 0;
@@ -348,12 +352,12 @@ int main(int argc, char** argv) {
     MPI_Cart_shift(cart_comm, 2, 1, &ctx.back, &ctx.front); 
 
     dim3 block(8, 8, 8);
-    dim3 grid((nx_loc + 7)/8, (ny_loc + 7)/8, (nz_loc + 7)/8);
+    dim3 grid((nz_loc + 7)/8, (ny_loc + 7)/8, (nx_loc + 7)/8);
     ctx.block2d = dim3(16, 16);
-    ctx.grid_x = dim3((ny_loc+15)/16, (nz_loc+15)/16);
-    ctx.grid_y = dim3((nx_loc+15)/16, (nz_loc+15)/16);
-    ctx.grid_z = dim3((nx_loc+15)/16, (ny_loc+15)/16);
-    dim3 bound_grid((nyg+15)/16, (nzg+15)/16);
+    ctx.grid_x = dim3((nz_loc+15)/16, (ny_loc+15)/16);
+    ctx.grid_y = dim3((nz_loc+15)/16, (nx_loc+15)/16);
+    ctx.grid_z = dim3((ny_loc+15)/16, (nx_loc+15)/16);
+    dim3 bound_grid((nzg+15)/16, (nyg+15)/16);
     dim3 grid_1d((max(nx_loc, max(ny_loc, nz_loc)) + 255) / 256);
 
     float time_calc = 0.0f, time_copy = 0.0f, time_comm = 0.0f, time_init = 0.0f;
